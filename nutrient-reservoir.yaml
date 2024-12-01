@@ -1,0 +1,1821 @@
+  # Calibrating the peristaltic nutrient pumps:
+  #  1. Ensure hoses are filled with liquid, with minimal air bubbles
+  #  2. Into an measuring device accurate to the mL dispense liquid using the "Test Pump X Calibration - 100mL" button in HA
+  #  3. Change the "Flow Rate Pump X" value in HA to correct the flow rate:
+  #     ie:  100mL test resulted in 95mL liquid dispensed. Change the value to:
+  #          New Flow Rate = Old Flow Rate * 95 / 100
+  #  4. Run the 100mL test again, and repeat calibration if needed until 100mL is dispensed correctly.
+
+# use for config values which user will not likely change often
+substitutions: 
+
+  device_name: nutrient-reservoir
+  device_name_pretty: Nutrient Reservoir
+
+  pin_onewire: "33"
+  pin_water_pressure_transducer: "9"
+  pin_water_level_transducer: "10"  
+  pin_hx711_1_dout: "18"
+  pin_hx711_1_clk: "16"
+  pin_hx711_2_dout: "39"
+  pin_hx711_2_clk: "37"
+  pin_water_inlet_valve: "12"
+  pin_pump_a: "3"
+  pin_pump_b: "5"
+  pin_pump_c: "7"
+  pin_pump_d: "11"
+
+  temperature_sensor_1_address: "0xa701191aa4091928"
+  temperature_sensor_2_address: "0x2e01191ad5de1128"
+
+  interval_debug_log: "5s"
+
+  interval_wifi_signal: "60s"
+
+  interval_temperature_sensor: "10s"
+
+  interval_psi_reading: "100ms"
+  window_size_psi_reading: "10"
+  send_every_psi_reading: "10"
+  psi_change_threshold: "0.5"
+
+  interval_water_level_reading: "100ms"
+  window_size_water_level_transducer_reading: "10"
+  send_every_water_level_transducer_reading: "10"
+
+  accuracy_decimals_mist_water_pressure: "4"
+  accuracy_decimals_reservoir_water_level: "4"
+  accuracy_decimals_reservoir_water_volume: "4"
+
+  log_water_inlet_valve_on: "Water Inlet Valve Opened!"
+  log_water_inlet_valve_off: "Water Inlet Valve Closed!"
+  log_pump_a_on: "Pump A Turned On!"
+  log_pump_a_off: "Pump A Turned Off!"
+  log_pump_b_on: "Pump B Turned On!"
+  log_pump_b_off: "Pump B Turned Off!"
+  log_pump_c_on: "Pump C Turned On!"
+  log_pump_c_off: "Pump C Turned Off!"
+  log_pump_d_on: "Pump C Turned On!"
+  log_pump_d_off: "Pump C Turned Off!"
+
+esphome:
+  name: $device_name
+  
+esp32:
+  board: lolin_s2_mini
+  variant: ESP32S2
+  framework:
+    type: arduino
+
+
+logger:
+  level: DEBUG
+  logs:
+    # this prevents the hx711 component from spamming the debug log with each reading -
+    # it seems like it is backwards, but it is correct... I get an error if I set to verbose
+    hx711: ERROR 
+
+debug:
+  update_interval: $interval_debug_log
+
+
+api:
+  id: native_api
+  encryption:
+    key: !secret api_key_nutrient_reservoir
+
+ota:
+  password: !secret ota_password_nutrient_reservoir
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # 10.0.0.238 is also reserved ip through router, I was having connection issues hopefully this fixes it?
+  manual_ip:
+    static_ip: 10.0.0.238
+    gateway: 10.0.0.1
+    subnet: 255.255.255.0
+  ap:
+    password: !secret device_ap_password
+captive_portal: #this does not have any parameters
+
+text_sensor:
+  # Device debug info
+  - platform: debug
+    device:
+      name: Device Info
+    reset_reason:
+      name: Reset Reason
+  # Provides device debug info
+  - platform: template
+    name: "Info Display"
+    id: info_display
+    # publish info from lambda like:  id(info_display).publish_state("Hello World");
+  
+dallas:
+  - pin: $pin_onewire
+    # update_interval: $interval_temperature_sensor
+
+globals:
+  # flag set during Reservoir 1 refill process, indicates that a fill is in progress
+  - id: flag_reservoir_1_refill_in_progress 
+    type: bool
+    restore_value: false
+    initial_value: '0'
+  # flag set while the psi sensor reading is increasing significantly over time,
+  # used to prevent starting refill process during plant solution pump out
+  # this flag is still not set perfectly, needs tweaking maybe use a derivative wrt time instead of just current-last value
+  # ... it is a fairly low probability event
+  - id: flag_psi_increasing 
+    type: bool
+    restore_value: false
+    initial_value: '0'
+  # the volume of water that is to be added during the refill process
+  # this is updated in the refill scripts
+  # used to calculate the duration of concentrated nutrients pumping
+  - id: water_volume_differential
+    type: float
+    restore_value: false
+    initial_value: '0'
+  # This is used to enable/disable some debug log messages which will crash the browser if left on bc they are very frequent
+  - id: verbose_debug_logging_enabled
+    type: bool
+    restore_value: false
+    initial_value: '0'
+
+# use for config values which user may change through the HA dashboard
+number: 
+
+
+  - platform: template
+    name: "Enable Nutrient A"
+    id: enable_nutrient_a
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 1
+    step: 1
+    initial_value: 1
+
+  - platform: template
+    name: "Enable Nutrient B"
+    id: enable_nutrient_b
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 1
+    step: 1
+    initial_value: 1
+
+  - platform: template
+    name: "Enable Nutrient C"
+    id: enable_nutrient_c
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 1
+    step: 1
+    initial_value: 1
+
+  - platform: template
+    name: "Valid Pressure Threshold"
+    id: valid_pressure_threshold
+    optimistic: true
+    restore_value: true
+    initial_value: 150
+    min_value: 0
+    max_value: 1000
+    step: 1
+    unit_of_measurement: "PSI"
+
+  - platform: template
+    name: "Valid Height Threshold"
+    id: valid_height_threshold
+    optimistic: true
+    restore_value: true
+    initial_value: 80
+    min_value: 0
+    max_value: 100
+    step: 0.1
+    unit_of_measurement: "in"
+
+  # Nutrient concentrate container volumes 
+  - platform: template
+    name: "Nutrient A Total Volume"
+    id: nutrient_a_total_volume
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 10000
+    step: 1
+    unit_of_measurement: "mL"
+    initial_value: 3785
+
+  - platform: template
+    name: "Nutrient B Total Volume"
+    id: nutrient_b_total_volume
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 10000
+    step: 1
+    unit_of_measurement: "mL"
+    initial_value: 3785
+
+  - platform: template
+    name: "Nutrient C Total Volume"
+    id: nutrient_c_total_volume
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 10000
+    step: 1
+    unit_of_measurement: "mL"
+    initial_value: 3785
+
+  # Keep track of nutrient usage  
+  - platform: template
+    name: "Nutrient A Used"
+    id: nutrient_a_used
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 1000000
+    step: 0.1
+    unit_of_measurement: "mL"
+
+  - platform: template
+    name: "Nutrient B Used"
+    id: nutrient_b_used
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 1000000
+    step: 0.1
+    unit_of_measurement: "mL"
+
+
+  - platform: template
+    name: "Nutrient C Used"
+    id: nutrient_c_used
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 100000
+    step: 0.1
+    unit_of_measurement: "mL"
+
+  - platform: template
+    name: "Refill Count"
+    id: refill_count
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 100000
+    step: 1
+    unit_of_measurement: "times"
+
+  - platform: template
+    name: "Total Gallons Mixed"
+    id: total_gallons_mixed
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 10000
+    step: 0.01
+    unit_of_measurement: "gal"
+
+  # Enable/disable autonomous refill process
+  # 0 -> no automatic refill
+  # 1 -> refill & dose Reservoir 1 autonomously with settings from HA.
+  - platform: template
+    name: Enable autonomous Reservoir 1 refilling
+    id: enable_auto_refill_1
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 1
+    step: 1
+    initial_value: 1
+
+  # Valve timeout duration (min)
+  # How long a valve can stay open before assuming something has gone wrong and closing it
+  - platform: template
+    name: Valve timeout duration
+    id: valve_timeout_duration
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 10
+    step: 1
+    initial_value: 5
+    unit_of_measurement: min
+
+  # Pump timeout duration (min)
+  # How long a pump can stay open before assuming something has gone wrong and turning it off
+  - platform: template
+    name: Pump timeout duration
+    id: pump_timeout_duration
+    unit_of_measurement: "min"
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 10
+    step: 1
+    initial_value: 5
+
+  # The minimum PSI level at which a Reservoir 1 refill is allowed
+  # used to prevent plant solution pump out during refill process 
+  - platform: template
+    name: Reservoir 1 Refill Minimum PSI 
+    id: reservoir_1_refill_minimum_psi
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "psi"
+    min_value: -10
+    max_value: 200
+    step: 1
+    initial_value: 85 # [=] psi
+
+  # The target water column height at which the Reservoir 1 refill process logic will be triggered  
+  - platform: template
+    name: Reservoir 1 Minimum Height
+    id: reservoir_1_minimum_height
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "in"
+    min_value: 3
+    max_value: 8
+    step: 0.25
+    initial_value: 5 # [=] in
+
+
+  # The target water column height at which the Reservoir 1 refill will stop   
+  - platform: template
+    name: Reservoir 1 Maximum Height
+    id: reservoir_1_maximum_height
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "in"
+    min_value: 3
+    max_value: 12
+    step: 0.25
+    initial_value: 10 # [=] in
+
+  # The dosing rate which nutrient solution A should be applied
+  - platform: template
+    name: Dose Rate Nutrient A
+    id: dose_rate_nutrient_a
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "mL/gal"
+    min_value: 0.001
+    max_value: 100
+    step: 0.001
+    initial_value: 15.141 # [4 mL/liter = 15.141 mL/gal]
+
+  # The dosing rate which nutrient solution B should be applied    
+  - platform: template
+    name: Dose Rate Nutrient B
+    id: dose_rate_nutrient_b
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "mL/gal"    
+    min_value: 0.001
+    max_value: 100
+    step: 0.001
+    initial_value: 15.141 # [4 mL/liter = 15.141 mL/gal]
+
+  # The dosing rate which nutrient solution C should be applied    
+  - platform: template
+    name: Dose Rate Nutrient C
+    id: dose_rate_nutrient_c
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "mL/gal"    
+    min_value: 0.001
+    max_value: 100
+    step: 0.001
+    initial_value: 15.141 # [4 mL/liter = 15.141 mL/gal]
+
+  # The flow rate of peristaltic pump A
+  - platform: template
+    name: Flow Rate Pump A
+    id: flow_rate_pump_a
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "mL/s" 
+    min_value: 0.001
+    max_value: 100
+    step: 0.001
+    initial_value: 1.470 # [100 mL/min = 1.667 mL/s]
+
+  # The flow rate of peristaltic pump B    
+  - platform: template
+    name: Flow Rate Pump B
+    id: flow_rate_pump_b
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "mL/s" 
+    min_value: 0.001
+    max_value: 100
+    step: 0.001
+    initial_value: 1.570 # [100 mL/min = 1.667 mL/s]
+
+  # The flow rate of peristaltic pump C    
+  - platform: template
+    name: Flow Rate Pump C
+    id: flow_rate_pump_c
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "mL/s" 
+    min_value: 0.001
+    max_value: 100
+    step: 0.001
+    initial_value: 1.656 # [100 mL/min = 1.667 mL/s]
+    
+  # The level to fill the water to when using test fill button
+  - platform: template
+    name: Test water fill level
+    id: test_water_fill_level
+    optimistic: true
+    restore_value: false
+    unit_of_measurement: "in" 
+    min_value: 1
+    max_value: 15
+    step: 0.5
+    initial_value: 6 # in
+
+  # The differential volume to fill the Reservoir 1 with when using test fill button
+  - platform: template
+    name: Test water fill differential volume
+    id: test_water_fill_differential_volume
+    optimistic: true
+    restore_value: false
+    unit_of_measurement: "gal" 
+    min_value: 1
+    max_value: 5
+    step: 0.5
+    initial_value: 3 # gal
+
+  - platform: template
+    name: Mist Water Pressure Offset
+    id: mist_water_pressure_offset
+    optimistic: true
+    restore_value: true
+    min_value: -100
+    max_value: 100
+    step: 0.1
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Offset
+    id: water_level_transducer_offset
+    optimistic: true
+    restore_value: true
+    min_value: -100
+    max_value: 100
+    step: 0.1
+    initial_value: 0    
+
+  # Water level transucer calibration points
+  - platform: template
+    name: Water Level Transducer Cal Point 1
+    id: water_level_transducer_cal_point_1
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 1 Value
+    id: water_level_transducer_cal_point_1_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 2
+    id: water_level_transducer_cal_point_2
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 2 Value
+    id: water_level_transducer_cal_point_2_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 3
+    id: water_level_transducer_cal_point_3
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 3 Value
+    id: water_level_transducer_cal_point_3_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 4
+    id: water_level_transducer_cal_point_4
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 4 Value
+    id: water_level_transducer_cal_point_4_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 5
+    id: water_level_transducer_cal_point_5
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 5 Value
+    id: water_level_transducer_cal_point_5_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 6
+    id: water_level_transducer_cal_point_6
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 6 Value
+    id: water_level_transducer_cal_point_6_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 7
+    id: water_level_transducer_cal_point_7
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 7 Value
+    id: water_level_transducer_cal_point_7_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 8
+    id: water_level_transducer_cal_point_8
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 8 Value
+    id: water_level_transducer_cal_point_8_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 9
+    id: water_level_transducer_cal_point_9
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 9 Value
+    id: water_level_transducer_cal_point_9_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 10
+    id: water_level_transducer_cal_point_10
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: Water Level Transducer Cal Point 10 Value
+    id: water_level_transducer_cal_point_10_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 0.1
+    initial_value: 0  
+
+  # Mist Water Pressure Sensor Calibration Points
+  - platform: template
+    name: PSI Sensor Cal Point 1
+    id: psi_sensor_cal_point_1
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 1 Value
+    id: psi_sensor_cal_point_1_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 2
+    id: psi_sensor_cal_point_2
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 2 Value
+    id: psi_sensor_cal_point_2_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 3
+    id: psi_sensor_cal_point_3
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 3 Value
+    id: psi_sensor_cal_point_3_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 4
+    id: psi_sensor_cal_point_4
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 4 Value
+    id: psi_sensor_cal_point_4_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 5
+    id: psi_sensor_cal_point_5
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 5 Value
+    id: psi_sensor_cal_point_5_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 6
+    id: psi_sensor_cal_point_6
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 6 Value
+    id: psi_sensor_cal_point_6_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 7
+    id: psi_sensor_cal_point_7
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 7 Value
+    id: psi_sensor_cal_point_7_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 8
+    id: psi_sensor_cal_point_8
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 8 Value
+    id: psi_sensor_cal_point_8_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 9
+    id: psi_sensor_cal_point_9
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 9 Value
+    id: psi_sensor_cal_point_9_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 10
+    id: psi_sensor_cal_point_10
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 4.5
+    step: 0.0001
+    initial_value: 0
+
+  - platform: template
+    name: PSI Sensor Cal Point 10 Value
+    id: psi_sensor_cal_point_10_value
+    optimistic: true
+    restore_value: true
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 0
+
+sensor:
+  - platform: uptime
+    id: uptime_sensor
+    name: Uptime Sensor
+    entity_category: diagnostic
+
+  - platform: wifi_signal
+    name: WiFi Signal dB
+    id: wifi_signal_db
+    update_interval: $interval_wifi_signal
+    entity_category: diagnostic
+
+  - platform: copy
+    source_id: wifi_signal_db
+    name: WiFi Signal Percent
+    filters:
+      - lambda: return min(max(2 * (x + 100.0), 0.0), 100.0);
+    unit_of_measurement: Signal %
+    entity_category: diagnostic
+
+
+  - platform: dallas
+    address: $temperature_sensor_1_address
+    name: Temperature Sensor 1
+    id: temperature_sensor_1
+    filters:
+      - filter_out: nan
+
+  - platform: dallas
+    address: $temperature_sensor_2_address
+    name: Temperature Sensor 2
+    filters:
+      - filter_out: nan
+
+
+  - platform: template
+    name: "Nutrient A Remaining"
+    id: nutrient_a_remaining
+    unit_of_measurement: "mL"
+    accuracy_decimals: 1
+    lambda: |-
+      return id(nutrient_a_total_volume).state - id(nutrient_a_used).state;
+
+  - platform: template
+    name: "Nutrient B Remaining"
+    id: nutrient_b_remaining
+    unit_of_measurement: "mL"
+    accuracy_decimals: 1
+    lambda: |-
+      return id(nutrient_b_total_volume).state - id(nutrient_b_used).state;
+
+  - platform: template
+    name: "Nutrient C Remaining"
+    id: nutrient_c_remaining
+    unit_of_measurement: "mL"
+    accuracy_decimals: 1
+    lambda: |-
+      return id(nutrient_c_total_volume).state - id(nutrient_c_used).state;
+
+  - platform: template
+    name: "Nutrient A Remaining Percentage"
+    id: nutrient_a_remaining_percentage
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    lambda: |-
+      return 100.0 * (id(nutrient_a_total_volume).state - id(nutrient_a_used).state) / id(nutrient_a_total_volume).state;
+  - platform: template
+    name: "Nutrient B Remaining Percentage"
+    id: nutrient_b_remaining_percentage
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    lambda: |-
+      return 100.0 * (id(nutrient_b_total_volume).state - id(nutrient_b_used).state) / id(nutrient_b_total_volume).state;
+  - platform: template
+    name: "Nutrient C Remaining Percentage"
+    id: nutrient_c_remaining_percentage
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    lambda: |-
+      return 100.0 * (id(nutrient_c_total_volume).state - id(nutrient_c_used).state) / id(nutrient_c_total_volume).state;
+
+
+  - platform: template
+    name: "Refill Count Display"
+    lambda: 'return id(refill_count).state;'
+    unit_of_measurement: "times"
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Total Gallons Mixed Display"
+    lambda: 'return id(total_gallons_mixed).state;'
+    unit_of_measurement: "gal"
+    accuracy_decimals: 2
+
+
+  - platform: adc
+    name: Water Level Transducer Raw
+    id: water_level_transducer_raw 
+    pin: $pin_water_level_transducer
+    unit_of_measurement: V
+    attenuation: auto
+    update_interval: $interval_water_level_reading
+    accuracy_decimals: $accuracy_decimals_reservoir_water_level
+    filters:
+      - sliding_window_moving_average:
+          window_size: $window_size_water_level_transducer_reading
+          send_every: $send_every_water_level_transducer_reading
+
+  - platform: template
+    name: Water Level Transducer Reservoir 1
+    id: water_level_transducer_reservoir_1
+    update_interval: $interval_water_level_reading    
+    unit_of_measurement: in
+    accuracy_decimals: $accuracy_decimals_reservoir_water_level
+    lambda: |-
+      float raw_value = id(water_level_transducer_raw).state;
+      std::vector<std::pair<float, float>> calibration_points = {
+        {id(water_level_transducer_cal_point_1).state, id(water_level_transducer_cal_point_1_value).state},
+        {id(water_level_transducer_cal_point_2).state, id(water_level_transducer_cal_point_2_value).state},
+        {id(water_level_transducer_cal_point_3).state, id(water_level_transducer_cal_point_3_value).state},
+        {id(water_level_transducer_cal_point_4).state, id(water_level_transducer_cal_point_4_value).state},
+        {id(water_level_transducer_cal_point_5).state, id(water_level_transducer_cal_point_5_value).state},
+        {id(water_level_transducer_cal_point_6).state, id(water_level_transducer_cal_point_6_value).state},
+        {id(water_level_transducer_cal_point_7).state, id(water_level_transducer_cal_point_7_value).state},
+        {id(water_level_transducer_cal_point_8).state, id(water_level_transducer_cal_point_8_value).state},
+        {id(water_level_transducer_cal_point_9).state, id(water_level_transducer_cal_point_9_value).state},
+        {id(water_level_transducer_cal_point_10).state, id(water_level_transducer_cal_point_10_value).state}
+      };
+
+      // Filter out points that are not set
+      calibration_points.erase(std::remove_if(calibration_points.begin(), calibration_points.end(), [](const std::pair<float, float>& point) {
+        return point.first == 0;
+      }), calibration_points.end());
+
+      // Default to raw value if less than two calibration points are available
+      float calibrated_value = raw_value;
+      if (calibration_points.size() >= 2) {
+        // Calculate the sums for linear regression
+        float sum_x = 0;
+        float sum_y = 0;
+        float sum_xy = 0;
+        float sum_x2 = 0;
+        size_t n = calibration_points.size();
+
+        for (const auto& point : calibration_points) {
+          float x = point.first;
+          float y = point.second;
+          sum_x += x;
+          sum_y += y;
+          sum_xy += x * y;
+          sum_x2 += x * x;
+        }
+
+        // Calculate slope (m) and intercept (b) for the best fit line y = mx + b
+        float m = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x);
+        float b = (sum_y - m * sum_x) / n;
+
+        // Calculate the calibrated value using the best fit line
+        calibrated_value = m * raw_value + b;
+      }
+
+      // Apply the offset
+      calibrated_value += id(water_level_transducer_offset).state;
+
+      // Apply the threshold filter
+      if (calibrated_value > id(valid_height_threshold).state) {
+        return {};
+      }
+      return calibrated_value;
+
+  - platform: copy
+    name: Reservoir 1 Water Level
+    id: reservoir_1_water_level
+    source_id: water_level_transducer_reservoir_1
+    unit_of_measurement: in
+    accuracy_decimals: $accuracy_decimals_reservoir_water_level
+    on_value:
+      - lambda: |-
+          if (id(verbose_debug_logging_enabled)) {
+            ESP_LOGI("main", "### Refill logic status: ###");  
+            ESP_LOGI("main", "enable_auto_refill_1: %f", id(enable_auto_refill_1).state  ); 
+            ESP_LOGI("main", "reservoir_1_minimum_height: %f", id(reservoir_1_minimum_height).state  ); 
+            ESP_LOGI("main", "reservoir_1_maximum_height: %f", id(reservoir_1_maximum_height).state  ); 
+            ESP_LOGI("main", "mist_water_pressure: %f", id(mist_water_pressure).state  ); 
+            ESP_LOGI("main", "reservoir_1_refill_minimum_psi: %f", id(reservoir_1_refill_minimum_psi).state  ); 
+            ESP_LOGI("main", "flag_psi_increasing: %d", id(flag_psi_increasing)  ); 
+            ESP_LOGI("main", "flag_reservoir_1_refill_in_progress: %d", id(flag_reservoir_1_refill_in_progress)  ); 
+            ESP_LOGI("main", "reservoir height:   x: %f", x  ); 
+            ESP_LOGI("main", "on value range below : x < id(reservoir_1_minimum_height).state: %d", x < id(reservoir_1_minimum_height).state  ); 
+
+            ESP_LOGI("main", " lambda conditions met?: %d", ( id(enable_auto_refill_1).state && !id(flag_psi_increasing) && (id(mist_water_pressure).state > id(reservoir_1_refill_minimum_psi).state) && !id(flag_reservoir_1_refill_in_progress) )  ); 
+            ESP_LOGI("main", "all conditions met?: %d", ( (x < id(reservoir_1_minimum_height).state) && id(enable_auto_refill_1).state && !id(flag_psi_increasing) && (id(mist_water_pressure).state > id(reservoir_1_refill_minimum_psi).state) && !id(flag_reservoir_1_refill_in_progress) )  ); 
+          }
+          id(automated_refill_check_reservoir_1).execute();
+
+
+  - platform: template
+    name: Reservoir 1 Water Volume
+    id: reservoir_1_water_volume
+    update_interval: $interval_water_level_reading
+    unit_of_measurement: gal
+    accuracy_decimals: $accuracy_decimals_reservoir_water_volume
+    lambda: |-
+      float level = id(reservoir_1_water_level).state;
+      id(reservoir_1_water_level_to_volume_converter).publish_state(level);
+      return id(reservoir_1_water_level_to_volume_converter).state;
+
+  # A converter used inside lambdas to calculate the reservoir 1 volume corresponding to some water column height
+  # Valid only for 3 and 5 gallon buckets.
+  - platform: template
+    internal: true  
+    id: reservoir_1_water_level_to_volume_converter
+    update_interval: $interval_water_level_reading
+    unit_of_measurement: gal
+    accuracy_decimals: $accuracy_decimals_reservoir_water_volume
+    filters:
+      - calibrate_linear: # With derived points, obtained from best fit lines from the empirical water level heights & volumes
+          - 3.233225917 -> 1.205173853 # in -> gal
+          - 5.859214753 -> 2.233598915 # in -> gal
+          - 9.506421469 -> 3.661967057 # in -> gal
+
+  # A converter used inside lambdas to calculate the water column height corresponding to some reservoir 1 volume
+  # Valid only for 3 and 5 gallon buckets.  
+  - platform: template
+    internal: true
+    id: reservoir_1_volume_to_water_level_converter
+    update_interval: $interval_water_level_reading
+    unit_of_measurement: in 
+    accuracy_decimals: $accuracy_decimals_reservoir_water_level
+    filters:
+      - calibrate_linear: # With derived points, obtained from best fit lines from the empirical water level heights & volumes
+          - 1.205173853 -> 3.233225917 # gal -> in
+          - 2.233598915 -> 5.859214753 # gal -> in
+          - 3.661967057 -> 9.506421469 # gal -> in
+
+
+  - platform: adc
+    name: PSI Sensor 1 Raw
+    id: psi_sensor_1_raw 
+    unit_of_measurement: V
+    pin: $pin_water_pressure_transducer
+    attenuation: auto
+    update_interval: $interval_psi_reading
+    accuracy_decimals: $accuracy_decimals_mist_water_pressure
+    filters:
+      - sliding_window_moving_average:
+          window_size: $window_size_psi_reading
+          send_every: $send_every_psi_reading
+
+  - platform: template
+    name: Calibrated Pressure Transducer 1
+    id: calibrated_pressure_transducer_1
+    update_interval: $interval_psi_reading
+    accuracy_decimals: $accuracy_decimals_mist_water_pressure
+    unit_of_measurement: PSI
+    lambda: |-
+      float raw_value = id(psi_sensor_1_raw).state;
+      std::vector<std::pair<float, float>> calibration_points = {
+        {id(psi_sensor_cal_point_1).state, id(psi_sensor_cal_point_1_value).state},
+        {id(psi_sensor_cal_point_2).state, id(psi_sensor_cal_point_2_value).state},
+        {id(psi_sensor_cal_point_3).state, id(psi_sensor_cal_point_3_value).state},
+        {id(psi_sensor_cal_point_4).state, id(psi_sensor_cal_point_4_value).state},
+        {id(psi_sensor_cal_point_5).state, id(psi_sensor_cal_point_5_value).state},
+        {id(psi_sensor_cal_point_6).state, id(psi_sensor_cal_point_6_value).state},
+        {id(psi_sensor_cal_point_7).state, id(psi_sensor_cal_point_7_value).state},
+        {id(psi_sensor_cal_point_8).state, id(psi_sensor_cal_point_8_value).state},
+        {id(psi_sensor_cal_point_9).state, id(psi_sensor_cal_point_9_value).state},
+        {id(psi_sensor_cal_point_10).state, id(psi_sensor_cal_point_10_value).state}
+      };
+
+      // Filter out points that are not set
+      calibration_points.erase(std::remove_if(calibration_points.begin(), calibration_points.end(), [](const std::pair<float, float>& point) {
+        return point.first == 0;
+      }), calibration_points.end());
+
+      // Default to raw value if less than two calibration points are available
+      float calibrated_value = raw_value;
+      if (calibration_points.size() >= 2) {
+        // Calculate the sums for linear regression
+        float sum_x = 0;
+        float sum_y = 0;
+        float sum_xy = 0;
+        float sum_x2 = 0;
+        size_t n = calibration_points.size();
+
+        for (const auto& point : calibration_points) {
+          float x = point.first;
+          float y = point.second;
+          sum_x += x;
+          sum_y += y;
+          sum_xy += x * y;
+          sum_x2 += x * x;
+        }
+
+        // Calculate slope (m) and intercept (b) for the best fit line y = mx + b
+        float m = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x);
+        float b = (sum_y - m * sum_x) / n;
+
+        // Calculate the calibrated value using the best fit line
+        calibrated_value = m * raw_value + b;
+      }
+
+      // Apply the offset
+      calibrated_value += id(mist_water_pressure_offset).state;
+
+      // Apply the threshold filter
+      if (calibrated_value > id(valid_pressure_threshold).state) {
+        return {};
+      }
+      return calibrated_value;
+
+  - platform: copy
+    name: Mist Water Pressure
+    id: mist_water_pressure
+    source_id: calibrated_pressure_transducer_1
+    unit_of_measurement: PSI
+    accuracy_decimals: $accuracy_decimals_mist_water_pressure
+    on_value:
+      - lambda: |-
+          static float last_value = std::numeric_limits<float>::max();
+          if (!id(flag_psi_increasing) && ((x - last_value) > $psi_change_threshold)) {
+            id(flag_psi_increasing) = 1;
+            ESP_LOGI("main", "### FLAG PSI INCREASING SET! ###");
+          } else if (id(flag_psi_increasing) && ((x - last_value) <= $psi_change_threshold)){
+            id(flag_psi_increasing) = 0;
+            ESP_LOGI("main", "### FLAG PSI INCREASING UN-SET! ###");
+          }
+          last_value = x;
+
+switch:
+  # Provides a way to restart device into safe mode from HA dashboard
+  - platform: safe_mode
+    name: $device_name_pretty Restart (Safe Mode) 
+
+  # Enable/disable some verbose debug logs
+  - platform: template
+    name: "Custom Log Switch"
+    id: custom_log_switch
+    optimistic: true
+    # assumed_state: true
+    turn_on_action:
+      - lambda: |- 
+          id(verbose_debug_logging_enabled) = 1;
+          ESP_LOGD("main", "Verbose debug logging enabled.");
+    turn_off_action:
+      - lambda: |- 
+          id(verbose_debug_logging_enabled) =  0;
+          ESP_LOGD("main", "Verbose debug logging disabled.");
+
+
+  # Water inlet valve
+  - platform: gpio
+    pin: $pin_water_inlet_valve
+    name: Water Inlet Valve
+    id: water_inlet_valve
+    inverted: false
+    on_turn_on:
+      - logger.log: 
+          format: $log_water_inlet_valve_on
+          level: INFO
+    on_turn_off:
+      - logger.log: 
+          format: $log_water_inlet_valve_off
+          level: INFO
+
+  # Water inlet valve with timeout
+  # This template switch is necessary because on_turn_on actions are not triggered if the switch is already on, but turn_on_action is.
+  #  This allows the timeout to be reset if the switch is turned on when it is already on.
+  - platform: template
+    name: Water Inlet Valve With Timeout
+    id: water_inlet_valve_with_timeout
+    inverted: false
+    turn_on_action:
+      then:
+      - script.stop: inlet_valve_timeout_timer  
+      - switch.turn_on: water_inlet_valve        
+      - script.execute: inlet_valve_timeout_timer      
+    turn_off_action:
+      then:
+      - lambda: |-
+          ESP_LOGI("main", "### water_inlet_valve_with_timeout - Valve off, stopping safety timeout script.. ###");               
+      - switch.turn_off: water_inlet_valve            
+      - script.stop: inlet_valve_timeout_timer
+
+  # Peristaltic pump for nutrient solution concentrate A
+  - platform: gpio
+    pin: $pin_pump_a
+    name: Pump A
+    id: pump_a
+    inverted: false
+    on_turn_on:
+      - logger.log: 
+          format: $log_pump_a_on
+          level: INFO      
+    on_turn_off:
+      - logger.log: 
+          format: $log_pump_a_off
+          level: INFO      
+
+  # Peristaltic pump for nutrient solution concentrate B
+  - platform: gpio
+    pin: $pin_pump_b
+    name: Pump B
+    id: pump_b
+    inverted: false
+    on_turn_on:
+      - logger.log: 
+          format: $log_pump_b_on
+          level: INFO            
+    on_turn_off:
+      - logger.log: 
+          format: $log_pump_b_off
+          level: INFO            
+
+  # Peristaltic pump for nutrient solution concentrate C
+  - platform: gpio
+    pin: $pin_pump_c
+    name: Pump C
+    id: pump_c
+    inverted: false
+    on_turn_on:
+      - logger.log: 
+          format: $log_pump_c_on
+          level: INFO            
+    on_turn_off:
+      - logger.log: 
+          format: $log_pump_c_off
+          level: INFO     
+
+  # Peristaltic pump for nutrient solution concentrate D, 
+  # which does not actually exist and is only included to provide a low value to the pump controller
+  - platform: gpio
+    pin: $pin_pump_d
+    name: Pump D (does not exist)
+    id: pump_d
+    inverted: false
+    on_turn_on:
+      - logger.log: 
+          format: $log_pump_d_on
+          level: INFO            
+    on_turn_off:
+      - logger.log: 
+          format: $log_pump_d_off
+          level: INFO     
+
+  # Pump A with timeout
+  # This template switch is necessary because on_turn_on actions are not triggered if the switch is already on, but turn_on_action is.
+  #  This allows the timeout to be reset if the switch is turned on when it is already on.
+  - platform: template
+    name: Pump A With Timeout
+    id: pump_a_with_timeout
+    inverted: false
+    turn_on_action:
+      then:
+      - script.stop: pump_a_timeout_timer  
+      - switch.turn_on: pump_a        
+      - script.execute: pump_a_timeout_timer      
+    turn_off_action:
+      then:
+      - lambda: |-
+          ESP_LOGI("main", "### pump_a_with_timeout - Valve off, stopping safety timeout script.. ###");               
+      - switch.turn_off: pump_a            
+      - script.stop: pump_a_timeout_timer
+
+  # Pump B with timeout
+  # This template switch is necessary because on_turn_on actions are not triggered if the switch is already on, but turn_on_action is.
+  #  This allows the timeout to be reset if the switch is turned on when it is already on.
+  - platform: template
+    name: Pump B With Timeout
+    id: pump_b_with_timeout
+    inverted: false
+    turn_on_action:
+      then:
+      - script.stop: pump_b_timeout_timer  
+      - switch.turn_on: pump_b        
+      - script.execute: pump_b_timeout_timer      
+    turn_off_action:
+      then:
+      - lambda: |-
+          ESP_LOGI("main", "### pump_b_with_timeout - Valve off, stopping safety timeout script.. ###");               
+      - switch.turn_off: pump_b            
+      - script.stop: pump_b_timeout_timer
+
+  # Pump C with timeout
+  # This template switch is necessary because on_turn_on actions are not triggered if the switch is already on, but turn_on_action is.
+  #  This allows the timeout to be reset if the switch is turned on when it is already on.
+  - platform: template
+    name: Pump C With Timeout
+    id: pump_c_with_timeout
+    inverted: false
+    turn_on_action:
+      then:
+      - script.stop: pump_c_timeout_timer  
+      - switch.turn_on: pump_c        
+      - script.execute: pump_c_timeout_timer      
+    turn_off_action:
+      then:
+      - lambda: |-
+          ESP_LOGI("main", "### pump_c_with_timeout - Valve off, stopping safety timeout script.. ###");               
+      - switch.turn_off: pump_c            
+      - script.stop: pump_c_timeout_timer
+
+button:
+  # Reset nutrient usage counters
+  - platform: template
+    name: "Reset Nutrient A Usage"
+    on_press:
+      - lambda: |-
+          id(nutrient_a_used) = 0;
+
+  - platform: template
+    name: "Reset Nutrient B Usage"
+    on_press:
+      - lambda: |-
+          id(nutrient_b_used) = 0;
+
+  - platform: template
+    name: "Reset Nutrient C Usage"
+    on_press:
+      - lambda: |-
+          id(nutrient_c_used) = 0;
+
+  - platform: template
+    name: "Reset Refill Count"
+    on_press:
+      - number.set:
+          id: refill_count
+          value: 0
+
+  - platform: template
+    name: "Reset Total Gallons Mixed"
+    on_press:
+      - number.set:
+          id: total_gallons_mixed
+          value: 0
+
+  # Test calibration for peristaltic pump A - pump a target 100mL.
+  - platform: template
+    name: "Test - Pump A Calibration - 100mL"
+    on_press:
+      then:
+        - logger.log: 
+            format:  "Starting Pump A calibration test, target=100mL"
+            level: INFO   
+        - script.execute:
+            id: dose_nutrient_volume_a
+            pump_volume: 100
+        - script.wait: dose_nutrient_volume_a
+        - lambda: |-
+            ESP_LOGI("main", "Pump A calibration test completed.");             
+
+  # Test calibration for peristaltic pump B - pump a target 100mL.            
+  - platform: template
+    name: "Test - Pump B Calibration - 100mL"
+    on_press:
+      then:
+        - logger.log: 
+            format: "Starting Pump B calibration test, target=100mL"
+            level: INFO   
+        - script.execute:
+            id: dose_nutrient_volume_b
+            pump_volume: 100
+        - script.wait: dose_nutrient_volume_b
+        - lambda: |-
+            ESP_LOGI("main", "Pump B calibration test completed.");               
+  # Test calibration for peristaltic pump C - pump a target 100mL.
+  - platform: template
+    name: "Test - Pump C Calibration - 100mL"
+    on_press:
+      then:
+        - logger.log: 
+            format: "Starting Pump C calibration test, target=100mL"
+            level: INFO   
+        - script.execute:
+            id: dose_nutrient_volume_c
+            pump_volume: 100
+        - script.wait: dose_nutrient_volume_c
+        - lambda: |-
+            ESP_LOGI("main", "Pump C calibration test completed.");   
+  # Test water fill - fill the reservoir 1 to the specified water column level (test_water_fill_level)
+  # NOTE: This only adds fill water, no nutrient solution!
+  - platform: template
+    name: "Test - Fill with water to test_water_fill_level"
+    on_press:
+      then:
+        - logger.log: 
+            format: "Starting inlet water fill test."
+            level: INFO   
+        - lambda: id(reservoir_1_fill_to_level)->execute(id(test_water_fill_level).state);
+        - script.wait: reservoir_1_fill_to_level
+        - lambda: |-
+            ESP_LOGI("main", "Test - Fill with water to test_water_fill_level completed!"); 
+  # Test water fill - fill the reservoir 1 with the specified differential volume of water (test_water_fill_differential_volume)
+  # NOTE: This only adds fill water, no nutrient solution!
+  - platform: template
+    name: "Test - Fill with additional water volume of test_water_fill_differential_volume"
+    on_press:
+      then:
+        - logger.log: 
+            format: "Test - Fill with additional water volume of test_water_fill_differential_volume - Starting..."
+            level: INFO   
+        - lambda: id(reservoir_1_fill_differential_volume)->execute(id(test_water_fill_differential_volume).state);
+        - script.wait: reservoir_1_fill_differential_volume
+        - lambda: |-
+            ESP_LOGI("main", "Test - Fill with additional water volume of test_water_fill_differential_volume - Completed!"); 
+  # # Test automated reservoir 1 fill & dose - Fills and mixes nutrients into the reservoir to the specified water column level (test_water_fill_level)
+  - platform: template
+    name: "Test - Automated Reservoir 1 water fill and nutrient dose with HA config"
+    on_press:
+      then:
+        - logger.log: 
+            format: "Test - Automated fill and nutrient dose test using config from HA dashboard - Starting..."
+            level: INFO   
+        - lambda: id(reservoir_1_fill_and_dose)->execute();
+        - script.wait: reservoir_1_fill_and_dose
+        - logger.log: 
+            format: "Test - Automated fill and nutrient dose test using config from HA dashboard - Completed."
+            level: INFO   
+
+
+script:
+  - id: inlet_valve_timeout_timer
+    mode: single               
+    then:
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Switch with timeout - water_inlet_valve - Starting... ###");             
+      - delay: !lambda "return 1000*60*id(valve_timeout_duration).state;" # ms [=] ms/s * s/min * min
+      - lambda: |-
+          ESP_LOGI("main", "### Script:  Switch with timeout - water_inlet_valve - TRIGGERED... valve has been on for too long, turning it off. ###");
+      - switch.turn_off: water_inlet_valve
+
+  - id: pump_a_timeout_timer
+    mode: single               
+    then:
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Pump with timeout - pump_a - Starting... ###");             
+      - delay: !lambda "return 1000*60*id(pump_timeout_duration).state;" # ms [=] ms/s * s/min * min
+      - lambda: |-
+          ESP_LOGW("main", "### Script:  Pump with timeout - pump_a - TRIGGERED... pump has been on for too long, turning it off. Is the nutrient solution concentrate empty?###");
+      - switch.turn_off: pump_a
+
+  - id: pump_b_timeout_timer
+    mode: single               
+    then:
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Pump with timeout - pump_b - Starting... ###");             
+      - delay: !lambda "return 1000*60*id(pump_timeout_duration).state;" # ms [=] ms/s * s/min * min
+      - lambda: |-
+          ESP_LOGW("main", "### Script:  Pump with timeout - pump_b - TRIGGERED... pump has been on for too long, turning it off. Is the nutrient solution concentrate empty? ###");
+      - switch.turn_off: pump_b
+
+  - id: pump_c_timeout_timer
+    mode: single               
+    then:
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Pump with timeout - pump_c - Starting... ###");             
+      - delay: !lambda "return 1000*60*id(pump_timeout_duration).state;" # ms [=] ms/s * s/min * min
+      - lambda: |-
+          ESP_LOGW("main", "### Script:  Pump with timeout - pump_c - TRIGGERED... pump has been on for too long, turning it off. Is the nutrient solution concentrate empty? ###");
+      - switch.turn_off: pump_c
+  # Pump specified volume of nutrient solution A
+  # NOTE: This only adds concentrated nutrient solution, no fill water!  
+  - id: dose_nutrient_volume_a
+    mode: single
+    parameters: 
+      pump_volume: float
+    then: 
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Dose nutrient - Nutrient: A, Volume: %.1f  - Starting... ###", 
+            pump_volume);
+      # Turn on pump for the time required to achieve desired pump_volume, then turn it off
+      - switch.turn_on: pump_a_with_timeout
+      - delay: !lambda "return 1000 * pump_volume / id(flow_rate_pump_a).state;" # ms [=] (ms/s) * mL / (mL/s)      
+      - switch.turn_off: pump_a_with_timeout
+      - lambda: |-
+          id(nutrient_a_used).publish_state(id(nutrient_a_used).state + pump_volume);
+          ESP_LOGI("main", "### Script: Dose nutrient - Nutrient: A, Volume: %.1f  - Completed. ###", 
+            pump_volume);
+
+  # Pump specified volume of nutrient solution B
+  # NOTE: This only adds concentrated nutrient solution, no fill water!  
+  - id: dose_nutrient_volume_b
+    mode: single
+    parameters: 
+      pump_volume: float
+    then: 
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Dose nutrient - Nutrient: B, Volume: %.1f  - Starting... ###", 
+            pump_volume);
+      # Turn on pump for the time required to achieve desired pump_volume, then turn it off
+      - switch.turn_on: pump_b_with_timeout
+      - delay: !lambda "return 1000 * pump_volume / id(flow_rate_pump_b).state;" # ms [=] (ms/s) * mL / (mL/s)      
+      - switch.turn_off: pump_b_with_timeout
+      - lambda: |-
+          id(nutrient_b_used).publish_state(id(nutrient_b_used).state + pump_volume);
+          ESP_LOGI("main", "### Script: Dose nutrient - Nutrient: B, Volume: %.1f  - Completed. ###", 
+            pump_volume);
+
+  # Pump specified volume of nutrient solution C
+  # NOTE: This only adds concentrated nutrient solution, no fill water!
+  - id: dose_nutrient_volume_c
+    mode: single
+    parameters: 
+      pump_volume: float
+    then: 
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Dose nutrient - Nutrient: C, Volume: %.1f  - Starting... ###", 
+            pump_volume);
+      # Turn on pump for the time required to achieve desired pump_volume, then turn it off
+      - switch.turn_on: pump_c_with_timeout
+      - delay: !lambda "return 1000 * pump_volume / id(flow_rate_pump_c).state;" # ms [=] (ms/s) * mL / (mL/s)      
+      - switch.turn_off: pump_c_with_timeout
+      - lambda: |-
+          id(nutrient_c_used).publish_state(id(nutrient_c_used).state + pump_volume);
+          ESP_LOGI("main", "### Script: Dose nutrient - Nutrient: C, Volume: %.1f  - Completed. ###", 
+            pump_volume);         
+
+  # Fill reservoir 1 to the specified water column level from water inlet valve
+  # NOTE: This only adds fill water, no nutrients!
+  - id: reservoir_1_fill_to_level
+    mode: single  
+    parameters:
+      target_level: float
+    then: 
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Reservoir 1 fill water column level - Starting... - Current level: %.1f, Target level: %.1f  ###",
+            id(reservoir_1_water_level).state, target_level);  
+      # While the water level is below the target level, open inlet valve
+      - while:
+          condition:
+            lambda: |-
+              return id(reservoir_1_water_level).state < target_level;            
+          then:
+            - lambda: |-
+                ESP_LOGI("main", "### Script: Reservoir 1 fill water column level - In progress... - Current level: %.1f, Target level: %.1f  ###",
+                  id(reservoir_1_water_level).state, target_level);
+
+                // turn on inlet valve with timeout if it isn't already on
+                if (!id(water_inlet_valve).state) {
+                  id(water_inlet_valve_with_timeout).turn_on();
+                }
+            - delay: $interval_water_level_reading
+      # Now that water level is above target level, close inlet valve
+      - switch.turn_off: water_inlet_valve_with_timeout
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Reservoir 1 fill water column level - Completed - Current level: %.1f ###",
+            id(reservoir_1_water_level).state);  
+
+
+  # Calculate the differential volume of fill water required to bring Reservoir 1 from current level to some target_water_level.
+  # NOTE: The result of this calculation is stored as a global variable: water_volume_differential
+  - id: calculate_water_volume_differential_to_reach_level
+    mode: single  
+    parameters:
+      target_water_level: float
+    then: 
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Calculate water volume differential to reach level - Starting... - Current level: %.1f, Target level: %.1f",
+            id(reservoir_1_water_level).state, target_water_level);
+          // convert current water level to current volume
+          id(reservoir_1_water_level_to_volume_converter).publish_state(id(reservoir_1_water_level).state);
+          float currentWaterVolume = id(reservoir_1_water_level_to_volume_converter).state;
+          ESP_LOGD("main", "### Script: Calculate water volume differential to reach level - calc result... - currentWaterVolume: %.1f ###", 
+          currentWaterVolume);
+          // calculate target total water volume
+          id(reservoir_1_water_level_to_volume_converter).publish_state(target_water_level);
+          float targetTotalWaterVolume = id(reservoir_1_water_level_to_volume_converter).state;
+          ESP_LOGD("main", "### Script: Calculate water volume differential to reach level - calc result... - targetTotalWaterVolume: %.1f ###", 
+          targetTotalWaterVolume);
+          // save water volume differential
+          id(water_volume_differential) = (targetTotalWaterVolume - currentWaterVolume);
+          ESP_LOGI("main", "### Script: Calculate water volume differential to reach level - Completed - Saved water volume differential: %.1f ###", id(water_volume_differential));
+  
+  # Fill reservoir 1 with specified differential volume of water from water inlet valve (add additional water of volume differential_volume_to_add to the current fill)
+  # NOTE: This only adds fill water, no nutrients!
+  - id: reservoir_1_fill_differential_volume
+    mode: single  
+    parameters:
+      differential_volume_to_add: float
+    then: 
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Reservoir 1 fill water differential volume - Starting... - Adding Volume: %.1f ###", 
+            differential_volume_to_add);
+          // Get the current water level and convert it to volume
+          float currentWaterLevel = id(reservoir_1_water_level).state;
+          id(reservoir_1_water_level_to_volume_converter).publish_state(currentWaterLevel);
+          float currentWaterVolume = id(reservoir_1_water_level_to_volume_converter).state;
+          ESP_LOGD("main", "### Script: Reservoir 1 fill water differential volume - calc result... - currentWaterVolume: %.1f ###", 
+          currentWaterVolume);
+          // calculate target final water volume
+          float targetWaterVolume = (currentWaterVolume + differential_volume_to_add);
+          ESP_LOGD("main", "### Script: Reservoir 1 fill water differential volume - calc result... - targetWaterVolume: %.1f ###", 
+          targetWaterVolume);
+          // convert target water volume to target water level
+          id(reservoir_1_volume_to_water_level_converter).publish_state(targetWaterVolume);
+          float targetWaterLevel = id(reservoir_1_volume_to_water_level_converter).state;
+          ESP_LOGD("main", "### Script: Reservoir 1 fill water differential volume - calc result... - targetWaterLevel: %.1f ###", 
+          targetWaterLevel);      
+          // fill to target water volume using reservoir_1_fill_to_level script
+          id(reservoir_1_fill_to_level)->execute(targetWaterLevel);
+      - script.wait: reservoir_1_fill_to_level
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Reservoir 1 fill water differential volume - Completed - Added volume (target): %.1f, Current volume: %.1f, Current level: %.1f, ###", 
+            differential_volume_to_add, id(reservoir_1_water_volume).state, id(reservoir_1_water_level).state);
+
+  # Fill and dose the Reservoir 1 using settings specified in HA.
+  # Refills from the current water level to the maximum water level & doses nutrients appropriately.
+  # NOTE: This does not contain logic to check if it is an acceptable time to refill. 
+  - id: reservoir_1_fill_and_dose
+    mode: single
+    then:
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Reservoir 1 automated fill and dose - Starting... - Refill to level: %.1f in, Dose rate nutrient A, B, C: %.3f, %.3f, %.3f mL/gal respectively ###", 
+          id(reservoir_1_maximum_height).state, id(dose_rate_nutrient_a).state, id(dose_rate_nutrient_b).state, id(dose_rate_nutrient_c).state);
+      - globals.set:
+          id: flag_reservoir_1_refill_in_progress
+          value: '1'
+      # Calculate differential volume to complete fill
+      - lambda: id(calculate_water_volume_differential_to_reach_level)->execute(id(reservoir_1_maximum_height).state);
+      - script.wait: calculate_water_volume_differential_to_reach_level
+      # Fill to 25% of differential volume (25% additional) & dose nutrient A concurrently
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Reservoir 1 automated fill and dose - Filling to 25 percent and dosing nutrient A. ###");
+          id(reservoir_1_fill_differential_volume)->execute(0.25*id(water_volume_differential));
+          if (id(enable_nutrient_a).state == 1) {
+            float doseVolumeA = id(water_volume_differential) * id(dose_rate_nutrient_a).state; // mL [=] gal*(mL/gal)
+            id(dose_nutrient_volume_a)->execute(doseVolumeA);
+          } else {
+            ESP_LOGI("main", "### Nutrient A is disabled, skipping dosing ###");
+          }
+      # Wait for current fill & dose to complete
+      - script.wait: reservoir_1_fill_differential_volume
+      - if:
+          condition: 
+            lambda: 'return id(enable_nutrient_a).state == 1;'
+          then:
+            - script.wait: dose_nutrient_volume_a
+      # Fill to 50% of differential volume (25% additional) & dose nutrient B concurrently
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Reservoir 1 automated fill and dose - Filling to 50 percent and dosing nutrient B. ###");
+          id(reservoir_1_fill_differential_volume)->execute(0.25*id(water_volume_differential));
+          if (id(enable_nutrient_b).state == 1) {
+            float doseVolumeB = id(water_volume_differential) * id(dose_rate_nutrient_b).state;
+            id(dose_nutrient_volume_b)->execute(doseVolumeB);
+          } else {
+            ESP_LOGI("main", "### Nutrient B is disabled, skipping dosing ###");
+          }
+      # Wait for current fill & dose to complete
+      - script.wait: reservoir_1_fill_differential_volume
+      - if:
+          condition: 
+            lambda: 'return id(enable_nutrient_b).state == 1;'
+          then:
+            - script.wait: dose_nutrient_volume_b
+      # Fill to 75% of differential volume (25% additional) & dose nutrient C concurrently
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Reservoir 1 automated fill and dose - Filling 75 percent and dosing nutrient C. ###");
+          id(reservoir_1_fill_differential_volume)->execute(0.25*id(water_volume_differential));
+          if (id(enable_nutrient_c).state == 1) {
+            float doseVolumeC = id(water_volume_differential) * id(dose_rate_nutrient_c).state;
+            id(dose_nutrient_volume_c)->execute(doseVolumeC);
+          } else {
+            ESP_LOGI("main", "### Nutrient C is disabled, skipping dosing ###");
+          }
+      # Wait for current fill & dose to complete
+      - script.wait: reservoir_1_fill_differential_volume
+      - if:
+          condition: 
+            lambda: 'return id(enable_nutrient_c).state == 1;'
+          then:
+            - script.wait: dose_nutrient_volume_c
+      # Fill to 100% of differential volume
+      - lambda: id(reservoir_1_fill_differential_volume)->execute(0.25*id(water_volume_differential));
+      # Wait for fill to complete
+      - script.wait: reservoir_1_fill_differential_volume
+      - globals.set:
+          id: flag_reservoir_1_refill_in_progress
+          value: '0'
+      - lambda: |-
+          ESP_LOGI("main", "### Script: Reservoir 1 automated fill and dose - Completed. ###");
+      # Update refill count and total gallons mixed
+      - number.increment: refill_count
+      - number.set:
+          id: total_gallons_mixed
+          value: !lambda "return id(total_gallons_mixed).state + id(water_volume_differential);"
+
+  # Checks if it time to do automated refill, and triggers refill script if it is
+  - id: automated_refill_check_reservoir_1
+    mode: single
+    then:
+      - lambda: |-
+          id(verbose_debug_logging_enabled) ? ESP_LOGI("main", "### automated_refill_check_reservoir_1: Script start ###")   : (void)0;
+
+          // if auto refill is enabled
+          if (id(enable_auto_refill_1).state) {
+
+            // if auto refill is not already in progress
+            if (!id(flag_reservoir_1_refill_in_progress)) {
+              id(verbose_debug_logging_enabled) ? ESP_LOGI("main", "### automated_refill_check_reservoir_1: Automated refill is enabled, starting refill logic... ###") : (void)0;
+
+              // if water level is below min threshold value
+              if (id(reservoir_1_water_level).state < id(reservoir_1_minimum_height).state) {
+                  id(verbose_debug_logging_enabled) ? ESP_LOGI("main", "### automated_refill_check_reservoir_1: Water level is below min threshold. Time to refill.###") : (void)0;
+
+                  // if psi is not increasing, psi is above refill threshold
+                  if (!id(flag_psi_increasing) && (id(mist_water_pressure).state > id(reservoir_1_refill_minimum_psi).state)) {
+
+                    // execute refill script
+                    id(reservoir_1_fill_and_dose).execute();
+                  }
+
+                  // if psi conditions are not met
+                  else {
+                    id(verbose_debug_logging_enabled) ? ESP_LOGI("main", "### automated_refill_check_reservoir_1: Automated refill is enabled, water is below min threshold, but PSI is below the minimum psi threshold. Waiting for PSI to increase before refilling reservoir to prevent pump out during refill process. ###") : (void)0;
+                  }
+              }
+
+              // if water level is above min threshold value
+              else {
+                id(verbose_debug_logging_enabled) ? ESP_LOGI("main", "### automated_refill_check_reservoir_1: Water level above min threshold. Not time to refill. ###") : (void)0;
+              }
+            }
+          }  
+
+          // this was preventing refill flag from being set due to stopping script early. it should not really be needed..
+          // safety/sanity check, stop refill and close valve if water level is above max threshold
+          //if (id(reservoir_1_water_level).state > id(reservoir_1_maximum_height).state) {
+          //  id(verbose_debug_logging_enabled) ? ESP_LOGI("main", "### automated_refill_check_reservoir_1: Reservoir level is above the maximum value, stopping refill script and closing inlet valve. This should not happen, something may be wrong! ###") : (void)0; 
+          //   id(reservoir_1_fill_and_dose).stop();
+          //   id(water_inlet_valve_with_timeout).turn_off();
+          //}
+
+          id(verbose_debug_logging_enabled) ? ESP_LOGI("main", "### automated_refill_check_reservoir_1: Script complete ###") : (void)0;
+
