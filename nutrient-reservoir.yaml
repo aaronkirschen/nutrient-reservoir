@@ -2,8 +2,7 @@
   #  1. Ensure hoses are filled with liquid, with minimal air bubbles
   #  2. Into an measuring device accurate to the mL dispense liquid using the "Test Pump X Calibration - 100mL" button in HA
   #  3. Change the "Flow Rate Pump X" value in HA to correct the flow rate:
-  #     ie:  100mL test resulted in 95mL liquid dispensed. Change the value to:
-  #          New Flow Rate = Old Flow Rate * 95 / 100
+  #     ie:  100mL test resulted in 95mL liquid dispensed. Change the value to increase flow rate proportionally.
   #  4. Run the 100mL test again, and repeat calibration if needed until 100mL is dispensed correctly.
 
 # use for config values which user will not likely change often
