@@ -7,7 +7,9 @@ Mine has been cobbled together with a wemos c1 mini module. You will need to upd
 You will need to calibrate the sensors - volumetric rate of your peristaltic pumps and the pressure sensor for water level. This is done in the HomeAssistant dashboard.
 
 # Issues
-AFAIK everything is working great except for the nutrient concentrate remaining percent. I'm pretty sure it gets resets when the unit turns off, should be an easy fix just need to store the current percent correctly but I haven't taken the time to look. I just check the concentrate bottle every week or so to make sure they are not empty currently.
+* AFAIK everything is working pretty well except for the nutrient concentrate remaining percent. I'm pretty sure it gets resets when the unit turns off, should be an easy fix just need to store the current percent correctly but I haven't taken the time to look. I just check the concentrate bottle every week or so to make sure they are not empty currently.
+
+* It also has issues with uptime, likely due to the really bad spamming of the log - it just continuously spams it right now.
 
 # What this is for?
 I use it to automatically mix nutrients for my outdoor drain-to-waste aeroponic garden. I have a seperate system that controls the water pressure and mist solenoids; this just fills up the nutrient reservoir. If your garden requires a nutrient reservoir, then this can fill and mix it for you from concentrated nutrients. There is no pH/concentration monitoring, so it is only suitable for drain-to-waste currently.
